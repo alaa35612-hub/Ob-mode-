@@ -658,6 +658,7 @@ class Box:
     border_width: int = 1
     text_valign: str = "text.align_center"
     border_style: str = "line.style_solid"
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def set_right(self, value: int) -> None:
         self.right = value
@@ -717,6 +718,26 @@ class Box:
 
     def get_right(self) -> int:
         return self.right
+
+
+@dataclass
+class OrderBlockRecord:
+    key: str
+    orientation: str
+    timeframe: Optional[str]
+    top: float
+    bottom: float
+    left: int
+    status: str = "active"
+    stage: str = "base"
+    source: str = "detection"
+    volume: Optional[float] = None
+    buy_volume: Optional[int] = None
+    sell_volume: Optional[int] = None
+    upgraded_to: Optional[str] = None
+
+    def price_range(self) -> Tuple[float, float]:
+        return (self.bottom, self.top)
 
 
 # ----------------------------------------------------------------------------
@@ -1325,6 +1346,7 @@ class SmartMoneyAlgoProE5:
         self.security_series: Dict[str, SecuritySeries] = {}
         self.ob_volume_history: Dict[str, PineArray] = {}
         self.ob_valid_history: Dict[str, bool] = {}
+        self.order_block_records: Dict[str, OrderBlockRecord] = {}
         self.security_bucket_tracker: Dict[str, Optional[int]] = {}
         self.tracer = tracer or ExecutionTracer(False)
 
@@ -1416,8 +1438,23 @@ class SmartMoneyAlgoProE5:
         color: str,
         text: str = "",
         text_color: str = "#000000",
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Box:
         bx = Box(left, right, top, bottom, color, color, text=text, text_color=text_color)
+        if metadata:
+            bx.metadata.update(metadata)
+            if metadata.get("ob_managed"):
+                self._ob_apply_metadata(
+                    bx,
+                    orientation=metadata.get("orientation"),
+                    timeframe=metadata.get("timeframe"),
+                    stage=metadata.get("stage"),
+                    status=metadata.get("status"),
+                    source=metadata.get("source"),
+                    volume=metadata.get("volume"),
+                    buy_volume=metadata.get("buy_volume"),
+                    sell_volume=metadata.get("sell_volume"),
+                )
         self.boxes.append(bx)
         self._register_box_event(bx, status="new")
         self._trace("box.new", "create", timestamp=right, left=left, right=right, top=top, bottom=bottom, color=color, text=text)
@@ -1426,10 +1463,29 @@ class SmartMoneyAlgoProE5:
     def _archive_box(self, box: Optional[Box], hist_text: str, store: PineArray) -> None:
         if not isinstance(box, Box):
             return
+        box.metadata.setdefault("ob_managed", True)
+        upper_text = hist_text.upper()
+        upgrade: Optional[str] = None
+        if "IDM" in upper_text:
+            upgrade = "IDM"
+            box.metadata["stage"] = "idm"
+        elif "EXT" in upper_text:
+            upgrade = "EXT"
+            box.metadata["stage"] = "ext"
+        box.metadata["status"] = "archived"
         box.set_text(hist_text)
         if box in self.boxes:
             self.boxes.remove(box)
         store.push(box)
+        self._ob_apply_metadata(
+            box,
+            orientation=box.metadata.get("orientation"),
+            timeframe=box.metadata.get("timeframe"),
+            stage="archived",
+            status="archived",
+            source=box.metadata.get("source"),
+            upgrade=upgrade,
+        )
         self._register_box_event(box, status="archived")
         self._trace("box.archive", "archive", timestamp=box.right, text=hist_text)
 
@@ -1638,6 +1694,34 @@ class SmartMoneyAlgoProE5:
             ts = event_time if isinstance(event_time, int) else box.left
             status_label = self.BOX_STATUS_LABELS.get(status, status)
             status_key = status if isinstance(status, str) and status else "active"
+            upgrade: Optional[str] = None
+            if key == "IDM_OB":
+                box.metadata.setdefault("ob_managed", True)
+                box.metadata["stage"] = "idm"
+                upgrade = "IDM"
+            elif key == "EXT_OB":
+                box.metadata.setdefault("ob_managed", True)
+                box.metadata["stage"] = "ext"
+                upgrade = "EXT"
+            elif key == "HIST_IDM_OB":
+                box.metadata.setdefault("ob_managed", True)
+                box.metadata.setdefault("stage", "archived")
+                upgrade = "IDM"
+            elif key == "HIST_EXT_OB":
+                box.metadata.setdefault("ob_managed", True)
+                box.metadata.setdefault("stage", "archived")
+                upgrade = "EXT"
+            if box.metadata.get("ob_managed"):
+                box.metadata["status"] = status_key
+                self._ob_apply_metadata(
+                    box,
+                    orientation=box.metadata.get("orientation"),
+                    timeframe=box.metadata.get("timeframe"),
+                    stage=box.metadata.get("stage"),
+                    status=status_key,
+                    source=box.metadata.get("source"),
+                    upgrade=upgrade,
+                )
             tally = self.console_box_status_tally[key]
             tally[status_key] += 1
             self.console_event_log[key] = {
@@ -1670,6 +1754,180 @@ class SmartMoneyAlgoProE5:
                     price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
                     message = f"{{ticker}} {box.text} Created, Range: {price_range}"
                     self.alertcondition(True, alert_title, message)
+
+    def _update_order_block_record(
+        self,
+        *,
+        key: str,
+        box: Optional[Box],
+        orientation: Optional[str],
+        timeframe: Optional[str],
+        stage: Optional[str],
+        status: Optional[str],
+        source: Optional[str],
+        volume: Optional[float],
+        buy_volume: Optional[int],
+        sell_volume: Optional[int],
+        upgrade: Optional[str] = None,
+    ) -> OrderBlockRecord:
+        record = self.order_block_records.get(key)
+        if isinstance(box, Box):
+            top = float(box.top)
+            bottom = float(box.bottom)
+            left = int(box.left)
+        else:
+            top = float("nan")
+            bottom = float("nan")
+            left = 0
+        if record is None:
+            record = OrderBlockRecord(
+                key=key,
+                orientation=orientation or "unknown",
+                timeframe=timeframe,
+                top=top,
+                bottom=bottom,
+                left=left,
+                status=status or "active",
+                stage=stage or "base",
+                source=source or "detection",
+                volume=volume,
+                buy_volume=buy_volume,
+                sell_volume=sell_volume,
+            )
+        else:
+            if orientation:
+                record.orientation = orientation
+            if timeframe is not None:
+                record.timeframe = timeframe
+            if not math.isnan(top):
+                record.top = top
+            if not math.isnan(bottom):
+                record.bottom = bottom
+            if left:
+                record.left = left
+            if status:
+                record.status = status
+            if stage:
+                record.stage = stage
+            if source:
+                record.source = source
+            if volume is not None:
+                record.volume = volume
+            if buy_volume is not None:
+                record.buy_volume = buy_volume
+            if sell_volume is not None:
+                record.sell_volume = sell_volume
+        if upgrade:
+            record.upgraded_to = upgrade
+        self.order_block_records[key] = record
+        return record
+
+    def _ob_apply_metadata(
+        self,
+        box: Box,
+        *,
+        orientation: Optional[str],
+        timeframe: Optional[str],
+        stage: Optional[str] = None,
+        status: Optional[str] = None,
+        source: Optional[str] = None,
+        volume: Optional[float] = None,
+        buy_volume: Optional[int] = None,
+        sell_volume: Optional[int] = None,
+        upgrade: Optional[str] = None,
+    ) -> OrderBlockRecord:
+        if not isinstance(box, Box):
+            raise TypeError("_ob_apply_metadata expects a Box instance")
+        metadata = box.metadata
+        metadata["ob_managed"] = True
+        if orientation:
+            metadata["orientation"] = orientation
+        else:
+            metadata.setdefault("orientation", "unknown")
+        if timeframe is not None:
+            metadata["timeframe"] = timeframe
+        else:
+            metadata.setdefault("timeframe", self.base_timeframe or "")
+        if stage:
+            metadata["stage"] = stage
+        else:
+            metadata.setdefault("stage", "base")
+        if status:
+            metadata["status"] = status
+        else:
+            metadata.setdefault("status", "active")
+        if source:
+            metadata["source"] = source
+        else:
+            metadata.setdefault("source", "detection")
+        if volume is not None:
+            metadata["volume"] = volume
+        if buy_volume is not None:
+            metadata["buy_volume"] = int(buy_volume)
+        if sell_volume is not None:
+            metadata["sell_volume"] = int(sell_volume)
+        if upgrade:
+            metadata["upgraded_to"] = upgrade
+        key = metadata.get("ob_key")
+        if not key:
+            key = f"ob:{id(box)}"
+            metadata["ob_key"] = key
+        record = self._update_order_block_record(
+            key=key,
+            box=box,
+            orientation=metadata.get("orientation"),
+            timeframe=metadata.get("timeframe"),
+            stage=metadata.get("stage"),
+            status=metadata.get("status"),
+            source=metadata.get("source"),
+            volume=metadata.get("volume"),
+            buy_volume=metadata.get("buy_volume"),
+            sell_volume=metadata.get("sell_volume"),
+            upgrade=upgrade,
+        )
+        return record
+
+    def _ob_mark_inactive(self, box: Box, status: str = "cleared") -> None:
+        if not isinstance(box, Box):
+            return
+        if not box.metadata.get("ob_managed"):
+            return
+        box.metadata["status"] = status
+        self._ob_apply_metadata(
+            box,
+            orientation=box.metadata.get("orientation"),
+            timeframe=box.metadata.get("timeframe"),
+            stage=box.metadata.get("stage"),
+            status=status,
+            source=box.metadata.get("source"),
+        )
+
+    def get_latest_order_block(self, bullish: bool, *, prefer_upgrade: bool = True) -> Optional[Tuple[float, float]]:
+        orientation = "bullish" if bullish else "bearish"
+        candidates = [
+            rec
+            for rec in self.order_block_records.values()
+            if rec.orientation == orientation and rec.status not in {"archived", "cleared", "removed"}
+        ]
+        usable = [
+            rec
+            for rec in candidates
+            if not any(math.isnan(val) for val in (rec.bottom, rec.top))
+        ]
+        pool = usable or candidates
+        if not pool:
+            return None
+
+        def _rank(rec: OrderBlockRecord) -> Tuple[int, int]:
+            if not prefer_upgrade:
+                return (1, rec.left)
+            stage = (rec.upgraded_to or rec.stage or "").lower()
+            mapping = {"idm": 3, "idm ob": 3, "ext": 2, "ext ob": 2}
+            primary = mapping.get(stage, mapping.get((rec.stage or "").lower(), 1))
+            return (primary, rec.left)
+
+        chosen = max(pool, key=_rank)
+        return (chosen.bottom, chosen.top)
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
@@ -4323,6 +4581,9 @@ class SmartMoneyAlgoProE5:
         left_arr: PineArray,
         type_arr: PineArray,
         vol_arr: PineArray,
+        buy_arr: PineArray,
+        sell_arr: PineArray,
+        timeframe: str,
         color_demand: str,
         color_supply: str,
         text_size: str,
@@ -4347,12 +4608,15 @@ class SmartMoneyAlgoProE5:
                 box.set_rightbottom(time_now, 0.0)
                 box.set_bgcolor("color.new(#000000,100)")
                 line.set_color("color.new(#000000,100)")
+                self._ob_mark_inactive(box)
                 continue
             top_val = float(top_arr.get(idx))
             btm_val = float(btm_arr.get(idx))
             left_val = int(left_arr.get(idx))
             type_val = int(type_arr.get(idx))
             vol_val = float(vol_arr.get(idx))
+            box.metadata.setdefault("ob_managed", True)
+            box.metadata.setdefault("source", "detection")
             box.set_lefttop(left_val, top_val)
             box.set_rightbottom(time_now + extend_delta * length_extend, btm_val)
             unit = ""
@@ -4387,6 +4651,22 @@ class SmartMoneyAlgoProE5:
             line.set_xy1(left_val, (top_val + btm_val) / 2.0)
             line.set_xy2(time_now + extend_delta * length_extend, (top_val + btm_val) / 2.0)
             line.set_color("color.gray" if show_line else "color.new(#000000,100)")
+            buy_raw = float(buy_arr.get(idx)) if buy_arr.size() > idx else float("nan")
+            sell_raw = float(sell_arr.get(idx)) if sell_arr.size() > idx else float("nan")
+            buy_val = None if math.isnan(buy_raw) else int(buy_raw)
+            sell_val = None if math.isnan(sell_raw) else int(sell_raw)
+            orientation = "bullish" if type_val == -1 else "bearish"
+            self._ob_apply_metadata(
+                box,
+                orientation=orientation,
+                timeframe=timeframe,
+                stage=box.metadata.get("stage"),
+                status=box.metadata.get("status"),
+                source=box.metadata.get("source"),
+                volume=vol_val,
+                buy_volume=buy_val,
+                sell_volume=sell_val,
+            )
 
     def _handle_ob_detection(
         self,
@@ -4462,6 +4742,9 @@ class SmartMoneyAlgoProE5:
             left_arr,
             type_arr,
             vol_arr,
+            buy_arr,
+            sell_arr,
+            timeframe,
             color_demand,
             color_supply,
             text_size,
@@ -4675,6 +4958,9 @@ class SmartMoneyAlgoProE5:
             self.ob_left,
             self.ob_type,
             self.ob_vol,
+            self.ob_buy_vol,
+            self.ob_sell_vol,
+            ds.i_tf_ob,
             ds.ibull_ob_css,
             ds.ibear_ob_css,
             ds.text_size_ob_,
@@ -4694,6 +4980,9 @@ class SmartMoneyAlgoProE5:
             self.ob_left_mtf,
             self.ob_type_mtf,
             self.ob_vol_mtf,
+            self.ob_buy_vol_mtf,
+            self.ob_sell_vol_mtf,
+            ds.i_tf_ob_mtf,
             ds.ibull_ob_css_2,
             ds.ibear_ob_css_2,
             ds.text_size_ob_2,
@@ -5676,6 +5965,15 @@ class SmartMoneyAlgoProE5:
         index = zoneArray.indexof(zone)
         if index == -1:
             return
+        if isinstance(zone, Box) and zone.metadata.get("ob_managed"):
+            self._ob_apply_metadata(
+                zone,
+                orientation=zone.metadata.get("orientation"),
+                timeframe=zone.metadata.get("timeframe"),
+                stage=zone.metadata.get("stage"),
+                status="removed",
+                source=zone.metadata.get("source"),
+            )
         if not self.inputs.order_block.showBrkob:
             if zone in self.boxes:
                 self.boxes.remove(zone)
@@ -6013,8 +6311,15 @@ class SmartMoneyAlgoProE5:
         text: str = "",
         text_size: Optional[str] = None,
         text_color: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Box:
-        box_obj = self.box_new(left, right, top, bottom, color, text=text)
+        meta = dict(metadata or {})
+        meta.setdefault("timeframe", meta.get("timeframe", self.base_timeframe or self.inputs.demand_supply.i_tf_ob))
+        meta.setdefault("stage", meta.get("stage", "base"))
+        meta.setdefault("status", meta.get("status", "active"))
+        if meta:
+            meta.setdefault("ob_managed", True)
+        box_obj = self.box_new(left, right, top, bottom, color, text=text, metadata=meta if meta else None)
         box_obj.set_text_color(self._color_new_expr(text_color or color))
         box_obj.set_text_size(text_size or self.inputs.order_block.txtsiz)
         box_obj.set_text_halign("text.align_center")
@@ -6177,6 +6482,19 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("IDM OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbulliem)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbulliembg)
+                    zone.metadata.setdefault("ob_managed", True)
+                    zone.metadata["stage"] = "idm"
+                    zone.metadata["source"] = "idm_upgrade"
+                    zone.metadata["orientation"] = "bullish"
+                    self._ob_apply_metadata(
+                        zone,
+                        orientation="bullish",
+                        timeframe=zone.metadata.get("timeframe", self.base_timeframe or self.inputs.demand_supply.i_tf_ob),
+                        stage="idm",
+                        status="new",
+                        source="idm_upgrade",
+                        upgrade="IDM",
+                    )
                     self._register_box_event(zone, status="new")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
@@ -6203,6 +6521,19 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("IDM OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbeariem)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbeariembg)
+                    zone.metadata.setdefault("ob_managed", True)
+                    zone.metadata["stage"] = "idm"
+                    zone.metadata["source"] = "idm_upgrade"
+                    zone.metadata["orientation"] = "bearish"
+                    self._ob_apply_metadata(
+                        zone,
+                        orientation="bearish",
+                        timeframe=zone.metadata.get("timeframe", self.base_timeframe or self.inputs.demand_supply.i_tf_ob),
+                        stage="idm",
+                        status="new",
+                        source="idm_upgrade",
+                        upgrade="IDM",
+                    )
                     self._register_box_event(zone, status="new")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
@@ -6260,6 +6591,19 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("EXT OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbull)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbullbg)
+                    zone.metadata.setdefault("ob_managed", True)
+                    zone.metadata["stage"] = "ext"
+                    zone.metadata["source"] = "ext_upgrade"
+                    zone.metadata["orientation"] = "bullish"
+                    self._ob_apply_metadata(
+                        zone,
+                        orientation="bullish",
+                        timeframe=zone.metadata.get("timeframe", self.base_timeframe or self.inputs.demand_supply.i_tf_ob),
+                        stage="ext",
+                        status="new",
+                        source="ext_upgrade",
+                        upgrade="EXT",
+                    )
                     self._register_box_event(zone, status="new")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
@@ -6286,6 +6630,19 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("EXT OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbear)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbearbg)
+                    zone.metadata.setdefault("ob_managed", True)
+                    zone.metadata["stage"] = "ext"
+                    zone.metadata["source"] = "ext_upgrade"
+                    zone.metadata["orientation"] = "bearish"
+                    self._ob_apply_metadata(
+                        zone,
+                        orientation="bearish",
+                        timeframe=zone.metadata.get("timeframe", self.base_timeframe or self.inputs.demand_supply.i_tf_ob),
+                        stage="ext",
+                        status="new",
+                        source="ext_upgrade",
+                        upgrade="EXT",
+                    )
                     self._register_box_event(zone, status="new")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
@@ -6572,6 +6929,10 @@ class SmartMoneyAlgoProE5:
                 top,
                 bot,
                 color,
+                metadata={
+                    "orientation": "bullish" if isBull else "bearish",
+                    "source": "poi_sweep",
+                },
             )
             zoneArray.push(box_obj)
             zoneArrayisMit.push(0)
@@ -6595,6 +6956,10 @@ class SmartMoneyAlgoProE5:
                         topZone,
                         botZone,
                         self.inputs.order_block.colorDemand,
+                        metadata={
+                            "orientation": "bullish",
+                            "source": "zone_flip",
+                        },
                     )
                 )
                 self.demandZoneIsMit.push(0)
@@ -6606,6 +6971,10 @@ class SmartMoneyAlgoProE5:
                         topZone,
                         botZone,
                         self.inputs.order_block.colorSupply,
+                        metadata={
+                            "orientation": "bearish",
+                            "source": "zone_flip",
+                        },
                     )
                 )
                 self.supplyZoneIsMit.push(0)
@@ -10651,6 +11020,15 @@ def _has_fvg(rt: Any, bullish: bool) -> bool:
 
 
 def _last_ob_zone(rt: Any, bullish: bool) -> Optional[Tuple[float, float]]:
+    getter = getattr(rt, "get_latest_order_block", None)
+    if callable(getter):
+        try:
+            result = getter(bullish)
+            if result:
+                lo, hi = result
+                return (float(lo), float(hi))
+        except Exception:
+            pass
     arr = getattr(rt, "demandZone" if bullish else "supplyZone", None)
     try:
         if arr and arr.size() > 0:
